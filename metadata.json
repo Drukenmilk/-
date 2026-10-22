@@ -1,0 +1,6 @@
+{
+  "name": "스마트 에듀버짓 - 학교 교직원 예산 관리 & 지출 예측 AI",
+  "description": "학교 교직원을 위한 엑셀형 목적사업비 및 기본예산 관리 시스템. 수량·단가 실시간 계산, K-에듀파인 연계 품의서, 교육청 지침 맞춤형 AI 예산 지출 추천 지원.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

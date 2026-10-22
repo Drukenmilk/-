@@ -2,7 +2,7 @@ import express, { Request, Response } from 'express';
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { GoogleGenAI, Type } from '@google/genai';
+import { GoogleGenAI, Type, ThinkingLevel } from '@google/genai';
 
 dotenv.config();
 
@@ -14,24 +14,26 @@ const PORT = Number(process.env.PORT) || 3000;
 
 app.use(express.json({ limit: '10mb' }));
 
-// Lazy initialize Gemini client
-const apiKey = process.env.GEMINI_API_KEY;
-const ai = apiKey
-  ? new GoogleGenAI({
-      apiKey,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
-        },
+// Helper to get Gemini client
+function getAiClient() {
+  const key = process.env.GEMINI_API_KEY;
+  if (!key) return null;
+  return new GoogleGenAI({
+    apiKey: key,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
       },
-    })
-  : null;
+    },
+  });
+}
 
 // Health check
 app.get('/api/health', (req: Request, res: Response) => {
+  const client = getAiClient();
   res.json({
     status: 'ok',
-    hasApiKey: Boolean(apiKey),
+    hasApiKey: Boolean(process.env.GEMINI_API_KEY),
     timestamp: new Date().toISOString(),
   });
 });
@@ -56,6 +58,7 @@ app.post('/api/recommend-spending', async (req: Request, res: Response) => {
     const safeRemaining = Number(remainingBudget) || 0;
     const safeTotal = Number(totalBudget) || 0;
 
+    const ai = getAiClient();
     if (!ai) {
       // Fallback deterministic generator if API key is not yet set in environment
       const fallbackResult = generateFallbackRecommendations(
@@ -103,10 +106,13 @@ ${pastExpenses
 
 위 조건과 남은 잔액(${safeRemaining.toLocaleString()}원)을 바탕으로, 담당 교직원이 K-에듀파인 품의서에 바로 등록할 수 있는 구체적인 엑셀 품목 추천 리스트(3~6개 항목)와 정산 가이드를 생성해주세요. 추천 항목들의 합계가 ${safeRemaining.toLocaleString()}원을 넘지 않고 잔액을 최적으로 소진해야 합니다.`;
 
-    const response = await ai.models.generateContent({
+    const generatePromise = ai.models.generateContent({
       model: 'gemini-3.8-flash',
       contents: promptText,
       config: {
+        thinkingConfig: {
+          thinkingLevel: ThinkingLevel.LOW,
+        },
         systemInstruction,
         responseMimeType: 'application/json',
         responseSchema: {
@@ -206,10 +212,27 @@ ${pastExpenses
       },
     });
 
-    const parsed = JSON.parse(response.text || '{}');
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('AI generation timeout')), 10000)
+    );
+
+    const response = await Promise.race([generatePromise, timeoutPromise]);
+
+    let rawText = response.text ? response.text.trim() : '{}';
+    if (rawText.startsWith('```json')) {
+      rawText = rawText.slice(7);
+    }
+    if (rawText.startsWith('```')) {
+      rawText = rawText.slice(3);
+    }
+    if (rawText.endsWith('```')) {
+      rawText = rawText.slice(0, -3);
+    }
+    rawText = rawText.trim();
+    const parsed = JSON.parse(rawText);
     return res.json(parsed);
   } catch (error: any) {
-    console.error('Gemini recommendation error:', error);
+    console.error('Gemini recommendation error detail:', error?.message || error);
     // Provide safe fallback response on error
     const { budgetTitle, budgetCategory, remainingBudget, totalBudget, focusArea } =
       req.body || {};
@@ -227,24 +250,63 @@ ${pastExpenses
   }
 });
 
+// Fallback consult answer when AI service is unavailable or experiencing spikes
+function getFallbackConsultAnswer(question: string, remainingBudget: number): string {
+  const q = question.toLowerCase();
+  const remStr = Number(remainingBudget || 0).toLocaleString();
+
+  if (q.includes('간식') || q.includes('다과') || q.includes('음료')) {
+    return `시·도 교육청 예산편성 기본지침에 따라 학생 간식비는 통상 1인 1회 4,000원~5,000원(다과 3,000원 이하) 범위 내에서 집행 가능합니다. 결재 시 "학생 출석부(또는 참가자 명단)"와 "간식 수령 서명부(영수증 포함)"를 반드시 에듀파인에 첨부하셔야 감사 시 지적을 예방할 수 있습니다.`;
+  }
+  if (q.includes('교사') || q.includes('지도서') || q.includes('참고서') || q.includes('비품')) {
+    return `목적사업비는 학생 직접 지원 목적이 원칙입니다. 학생 수업 지도에 필수적인 1:1 지도용 교재나 지도서는 교재교구비로 집행 가능하나, 순수 교사용 연구도서나 교사용 전자비품은 학교기본운영비(교과운영비)로 지출하셔야 지침 위반을 방지할 수 있습니다.`;
+  }
+  if (q.includes('협의회') || q.includes('식대') || q.includes('회의')) {
+    return `목적사업비 내 협의회비는 전체 사업비의 5%~10% 이내, 1인당 30,000원 이하(식비 기준)로 엄격히 제한됩니다. 협의록(일시, 장소, 참석자 서명부, 회의내용)과 카드 영수증을 필히 구비하여 품의하시기 바랍니다.`;
+  }
+  if (q.includes('반납') || q.includes('이월') || q.includes('불용') || q.includes('연말')) {
+    return `목적사업비는 명시이월 승인을 받지 않은 한 회계연도 말(2월)에 집행잔액이 교육청으로 전액 반납(불용)됩니다. 현재 남은 잔액(${remStr}원)은 11~12월 중 학생 맞춤형 교재, 보드게임, 체험학습 재료비 등으로 계획을 세워 알차게 소진하시는 것을 권장합니다.`;
+  }
+  if (q.includes('견적서') || q.includes('계약') || q.includes('s2b')) {
+    return `2,000만원 이하 1인 수의계약 시 1건의 견적서로 가능하며, 통상 200만원 초과 시 비교견적서(2곳 이상)를 요구하는 학교가 많습니다. 교구 및 문구류는 학교장터(S2B)를 이용하시면 행정실 계약 절차가 훨씬 간소화됩니다.`;
+  }
+
+  return `학교회계 목적사업비는 교부조건과 학생 직접지원 원칙을 준수해야 합니다. 현재 남은 잔액(${remStr}원)은 품의서 작성 시 '산출내역(수량×단가=금액)'을 구체적으로 기재하시고, 검수조서와 납품사진을 구비하여 집행하시기 바랍니다.`;
+}
+
 // Smart Question/Consult Endpoint for School Teachers
 app.post('/api/consult-budget', async (req: Request, res: Response) => {
+  const { question = '', budgetTitle = '', remainingBudget = 0 } = req.body || {};
   try {
-    const { question, budgetTitle, remainingBudget } = req.body;
+    const ai = getAiClient();
     if (!ai) {
       return res.json({
-        answer: `학교회계 목적사업비는 교부 목적에 맞는 품목에 한해 집행이 가능합니다. 남은 잔액(${Number(remainingBudget || 0).toLocaleString()}원) 집행 시 K-에듀파인 비목별 산출내역(수량×단가)과 검수조서 증빙을 반드시 확인하시기 바랍니다.`,
+        answer: getFallbackConsultAnswer(question, remainingBudget),
       });
     }
 
-    const response = await ai.models.generateContent({
+    const generatePromise = ai.models.generateContent({
       model: 'gemini-3.8-flash',
       contents: `질문: "${question}"\n관련 예산: "${budgetTitle}" (잔액: ${Number(remainingBudget || 0).toLocaleString()}원)\n대한민국 초·중·고 학교회계 지침(에듀파인 규정, 공공기관 예산집행지침, 목적사업비 교부조건)에 근거하여 교직원이 현장에서 즉시 적용할 수 있도록 명쾌하고 실용적인 답변을 3~4문장으로 작성해주세요.`,
+      config: {
+        thinkingConfig: {
+          thinkingLevel: ThinkingLevel.LOW,
+        },
+      },
     });
 
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('AI consult timeout')), 7000)
+    );
+
+    const response = await Promise.race([generatePromise, timeoutPromise]);
     return res.json({ answer: response.text });
   } catch (err: any) {
-    return res.status(500).json({ error: err.message });
+    console.error('Consult error detail:', err?.message || err);
+    // Gracefully return school accounting guidance without breaking UI
+    return res.json({
+      answer: getFallbackConsultAnswer(question, remainingBudget),
+    });
   }
 });
 
